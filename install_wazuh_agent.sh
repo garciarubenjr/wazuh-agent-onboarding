@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --------- USER SETTINGS ----------
+# --------- USER SETTINGS (override via env vars) ----------
 MANAGER_IP="${MANAGER_IP:-192.168.10.100}"
-ENROLL_PASS="${ENROLL_PASS:-ChangeMe_StrongPassword123!}"
+ENROLL_PASS="${ENROLL_PASS:-}"
 AGENT_NAME="${AGENT_NAME:-$(hostname -s)}"
 AGENT_GROUP="${AGENT_GROUP:-default}"
 WAZUH_VERSION="${WAZUH_VERSION:-4.14}"   # repo major/minor line
-# ----------------------------------
+# ----------------------------------------------------------
 
 log() { echo -e "[+] $*"; }
 err() { echo -e "[!] $*" >&2; }
 
 if [[ $EUID -ne 0 ]]; then
   err "Run as root: sudo -E $0"
+  exit 1
+fi
+
+if [[ -z "${ENROLL_PASS}" ]]; then
+  err "ENROLL_PASS is required (this is the agent enrollment password, not the dashboard password)."
+  err "Example: sudo -E MANAGER_IP=192.168.10.100 ENROLL_PASS='YourEnrollPassword' $0"
   exit 1
 fi
 
@@ -28,30 +34,25 @@ echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/$
 
 apt-get update -y
 
-log "Installing wazuh-agent..."
-apt-get install -y wazuh-agent
+log "Installing + enrolling wazuh-agent (doc-style deployment variables)..."
+# Clean any previous key to avoid duplicates if a VM snapshot was reused
+rm -f /var/ossec/etc/client.keys 2>/dev/null || true
 
-log "Configuring agent to talk to manager ${MANAGER_IP}..."
-OSSEC_CONF="/var/ossec/etc/ossec.conf"
-if [[ ! -f "$OSSEC_CONF" ]]; then
-  err "Missing $OSSEC_CONF (agent install failed?)"
-  exit 1
-fi
+export WAZUH_MANAGER="${MANAGER_IP}"
+export WAZUH_AGENT_NAME="${AGENT_NAME}"
+export WAZUH_AGENT_GROUP="${AGENT_GROUP}"
+export WAZUH_REGISTRATION_PASSWORD="${ENROLL_PASS}"
 
-# Replace existing manager address if present
-sed -i "s|<address>.*</address>|<address>${MANAGER_IP}</address>|" "$OSSEC_CONF"
+DEBIAN_FRONTEND=noninteractive apt-get install -y wazuh-agent
 
-log "Enrolling agent '${AGENT_NAME}' (group: '${AGENT_GROUP}') with manager ${MANAGER_IP}:1515 ..."
-systemctl stop wazuh-agent || true
-rm -f /var/ossec/etc/client.keys || true
+log "Enabling and starting wazuh-agent..."
+systemctl enable --now wazuh-agent
 
-/var/ossec/bin/agent-auth -m "${MANAGER_IP}" -p 1515 -P "${ENROLL_PASS}" -A "${AGENT_NAME}" -G "${AGENT_GROUP}"
+log "Quick health check (last 30 log lines):"
+tail -n 30 /var/ossec/logs/ossec.log || true
 
-log "Starting wazuh-agent..."
-systemctl enable wazuh-agent >/dev/null
-systemctl restart wazuh-agent
+log "Service status:"
+systemctl --no-pager --full status wazuh-agent | sed -n '1,14p'
 
-log "Checking status..."
-systemctl --no-pager --full status wazuh-agent | sed -n '1,12p'
+log "Done. If it shows disconnected, verify manager ports 1514/tcp and 1515/tcp are reachable and the enrollment password is correct."
 
-log "Done. If it shows as disconnected, check manager ports 1514/1515 and enrollment password."
